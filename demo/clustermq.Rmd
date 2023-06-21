@@ -1,0 +1,179 @@
+---
+title: "clustermq example"
+author: "Michael Mayer"
+date: "2023-06-21"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(palmerpenguins)
+```
+
+## Introduction
+
+[`clustermq`](https://mschubert.github.io/clustermq/) is an R package that uses the [zeromq](https://zeromq.org/) protocol for efficient inter-node/process communication. In contrast to [`batchtools`](https://mllg.github.io/batchtools/) that uses a disk-based registry, `clustermq` runs everything in-memory and hence has [much better scalability](https://github.com/mschubert/clustermq#comparison-to-other-packages).
+
+## Simple example
+
+Using the `palmerpenguins` dataset we want to run some `glm`
+
+```{r compute}
+compute <- function(n) {
+
+  library(palmerpenguins)
+  
+  # Our dataset
+  x <- as.data.frame(penguins[c(4, 1)])
+  
+  ind <- sample(344, 344, replace = TRUE)
+  result1 <-
+    glm(x[ind, 2] ~ x[ind, 1], family = binomial(logit))
+  coefficients(result1)
+}
+```
+
+Using this `compute()` function, we now simply can run
+
+```{r compute_exec}
+compute(1)
+```
+
+If we now want to run the same compute function say a 100 times, we can use the `sapply` function
+
+```{r sapply}
+res<-sapply(1:100,compute)
+```
+
+Let's run this function a 10, 100 and 1000 times and measure the compute time
+
+```{r sapply_microbenchmark}
+library(microbenchmark)
+microbenchmark(
+  sapply(1:10,compute),
+  sapply(1:100,compute),
+  sapply(1:1000,compute),
+  times=10)
+```
+## Enter clustermq
+
+Now let's do the same with `clustermq`. 
+
+```{r cmq_init}
+library(clustermq)
+
+system.time(res<-Q(compute, n=1:100, n_jobs=1))
+```
+### Scaling up 
+
+```{r cmq_microbenchmark}
+microbenchmark(
+  res<-Q(compute, n=1:1000, verbose=FALSE, n_jobs=1, chunk_size=10),
+  res<-Q(compute, n=1:1000, verbose=FALSE, n_jobs=2, chunk_size=10),
+  res<-Q(compute, n=1:1000, verbose=FALSE, n_jobs=4, chunk_size=10),
+  res<-Q(compute, n=1:1000, verbose=FALSE, n_jobs=8, chunk_size=10),
+  times=10
+)
+```
+
+Note the use of `chunk_size` above that is used to chunk individual tasks together. 
+
+### `foreach` loops
+
+Now let's run the same thing via `foreach` loops
+
+```{r computeforeach_cmq}
+computeforeach_cmq <- function(samples, tasks) {
+  library(foreach)
+  library(palmerpenguins)
+ 
+  # Register parallel backend to foreach
+  register_dopar_cmq(
+    n_jobs = tasks,
+    log_worker = FALSE,
+    verbose=FALSE, 
+    chunk_size=10
+  )
+  
+  # Our dataset
+  x <- as.data.frame(penguins[c(4, 1)])
+  
+  # Number of samples to simulate
+  samples <- samples
+  
+  # Main loop
+  foreach(i = 1:samples, .combine = rbind) %dopar% {
+    ind <- sample(344, 344, replace = TRUE)
+    result1 <-
+      glm(x[ind, 2] ~ x[ind, 1], family = binomial(logit))
+    coefficients(result1)
+  }
+}
+```
+
+Now, let's test this `computeforeach_cmq` function for a couple of scenarious
+
+```{r computeforach_microbenchmark}
+library(clustermq) 
+library(microbenchmark)
+microbenchmark(
+  computeforeach_cmq(1000,1),
+  computeforeach_cmq(1000,2),
+  computeforeach_cmq(1000,4),
+  computeforeach_cmq(1000,8),
+  times=10
+)
+```
+
+## `doFuture` and `future.batchtools`
+
+While there unfortunately is not yet a fully functional `future.clustermq` package, we have to make do with `future.batchtools` for the moment 
+
+```{r future}
+library(doFuture)
+library(doRNG)
+registerDoFuture()
+library(future.batchtools)
+```
+
+Let's retry our `computeforeach` function again, but without the clustermq backend
+
+```{r computeforeach_future}
+computeforeach_future <- function(samples, tasks) {
+  library(foreach)
+  library(palmerpenguins)
+  
+  # Let's plan to have a maximum of tasks workers
+  plan(batchtools_slurm,workers=tasks)
+  
+  # Our dataset
+  x <- as.data.frame(penguins[c(4, 1)])
+  
+  # Number of samples to simulate
+  samples <- samples
+  
+  # Main loop
+  foreach(i = 1:samples, .combine = rbind,.options.future = list(chunk.size = 10)) %dorng% {
+    ind <- sample(344, 344, replace = TRUE)
+    result1 <-
+      glm(x[ind, 2] ~ x[ind, 1], family = binomial(logit))
+    coefficients(result1)
+  }
+}
+```
+
+Now, let's test this `computeforeach_future` function for a couple of scenarious
+
+```{r computeforeach_future_microbenchmark,eval=FALSE}
+library(clustermq) 
+library(microbenchmark)
+microbenchmark(
+  computeforeach_future(1000,1),
+  computeforeach_future(1000,2),
+  computeforeach_future(1000,4),
+  computeforeach_future(1000,8),
+  times=10
+)
+```
